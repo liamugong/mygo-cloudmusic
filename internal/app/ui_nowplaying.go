@@ -1,7 +1,9 @@
 package app
 
 import (
+	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -9,6 +11,7 @@ import (
 
 	"netease-music-mygo/internal/lyrics"
 	"netease-music-mygo/internal/netease"
+	"netease-music-mygo/internal/player"
 )
 
 var white = ui.RGB(255, 255, 255)
@@ -184,7 +187,21 @@ func (a *app) nowPlayingBody(c *ui.Context, tr *netease.Track, art *artwork, acc
 				ui.Row(c).Height(16).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, clock(pl.Position())).FontSize(11).FontFeatures("tnum").TextColor(white.Alpha(0.5))
 					ui.Spacer(c)
-					qualityBadge(c, pl.Stream(), a.settings.Quality)
+					if st := pl.Stream(); st != nil {
+						var status player.PlaybackStatus
+						// Reading MPV's live audio properties every frame is
+						// only worth it when the badge can say something:
+						// a high-quality level, or an external engine whose
+						// output we must confirm. Ordinary built-in lossy
+						// playback keeps the cheap path.
+						if netease.ShortLabel(st.Level) != "" || netease.ShortLabel(a.settings.Quality) != "" || pl.UsingMPV() || pl.IsCasting() {
+							status = pl.Status()
+						}
+						qualityBadge(c, st, a.settings.Quality, status, func(detail string) {
+							a.toast = detail
+							a.changed()
+						})
+					}
 					ui.Spacer(c)
 					status := "-" + clock(pl.Duration()-pl.Position())
 					if pl.Loading() {
@@ -348,28 +365,190 @@ func (a *app) radioChip(c *ui.Context, name string) {
 	}
 }
 
-// qualityBadge marks the high quality stream that plays: lossless, Hi-Res,
-// spatial stereo, surround, master or an immersive format.
-func qualityBadge(c *ui.Context, st *netease.Stream, requested string) {
-	if st == nil {
-		return
-	}
-	label := netease.ShortLabel(st.Level)
-	if label == "" && requested == "" {
-		return
-	}
-	if requested != "" && st.Level != "" && st.Level != requested {
-		if label == "" {
-			label = "已降档"
-		} else {
-			label += " · 已降档"
-		}
-	}
+// qualityBadge marks the stream that plays and how it reaches the output: the
+// level asked for, the level actually playing, the engine decoding it and
+// whether that engine confirmed its output. Only channels read back from the
+// engine can confirm surround — a stream label never can — so when the count
+// is unknown the badge says 输出未确认 rather than guessing from the format.
+func qualityBadge(c *ui.Context, st *netease.Stream, requested string, status player.PlaybackStatus, onDetail func(string)) {
+	label, detail := qualityBadgeText(st, requested, status)
 	if label == "" {
 		return
 	}
-	ui.Text(c, label).FontSize(9.5).FontWeight(800).LetterSpacing(0.6).TextColor(ui.Hex("#f5d58a")).
-		Padding(1, 6).Radius(4).Border(1, ui.Hex("#f5d58a").Alpha(0.55))
+	badge := ui.Text(c, label).FontSize(9.5).FontWeight(800).LetterSpacing(0.6).TextColor(ui.Hex("#f5d58a")).
+		Padding(1, 6).Radius(4).Border(1, ui.Hex("#f5d58a").Alpha(0.55)).SingleLine()
+	if detail != "" {
+		badge.Label(detail).Tooltip(detail)
+		if onDetail != nil {
+			badge.OnClick(func() { onDetail(detail) })
+		}
+	}
+}
+
+// qualityBadgeText builds the compact badge and its accessible description
+// from the player's status, never from a level name alone.
+func qualityBadgeText(st *netease.Stream, requested string, status player.PlaybackStatus) (label, detail string) {
+	if st == nil {
+		return "", ""
+	}
+	req := status.RequestedLevel
+	if req == "" {
+		req = requested
+	}
+	// The badge exists for a quality choice and what became of it: ordinary
+	// lossy playback on the built-in decoder has nothing to confirm. MPV and
+	// DLNA always show it because their output is the point.
+	quality := netease.ShortLabel(req) != "" || netease.ShortLabel(st.Level) != "" || netease.ShortLabel(status.ServedLevel) != ""
+	engine := status.Engine
+	if engine == "" {
+		engine = "builtin"
+	}
+	if !quality && engine == "builtin" && status.FallbackReason == "" && status.ProcessingNote == "" && len(status.PropertyErrors) == 0 {
+		return "", ""
+	}
+	plan := status.EffectiveLevel
+	// Only a level the server really reported counts as the level served:
+	// netease.go fills an absent level in with the one asked for, and that
+	// fill-in is not proof of what the server sent.
+	actual, actualKnown := "", false
+	if status.LevelReported {
+		actual = status.ServedLevel
+		if actual == "" {
+			actual = st.Level
+		}
+		actualKnown = actual != ""
+	}
+	reqName, planName, actualName := levelDisplay(req), levelDisplay(plan), levelDisplay(actual)
+	level := ""
+	switch {
+	case reqName != "" && actualKnown && reqName != actualName:
+		level = reqName + "→" + actualName
+	case actualKnown:
+		level = actualName
+	case reqName != "":
+		level = reqName
+	case planName != "":
+		level = planName
+	}
+	visible := make([]string, 0, 5)
+	if level != "" {
+		visible = append(visible, level)
+	}
+	if eng := engineDisplay(engine); eng != "" {
+		visible = append(visible, eng)
+	}
+	if status.Hrtf {
+		visible = append(visible, "HRTF 双耳")
+	}
+	if status.OutputChannels > 0 {
+		if engine == "builtin" && !status.Hrtf {
+			visible = append(visible, fmt.Sprintf("内置固定 %d声道", status.OutputChannels))
+		} else if engine == "builtin" {
+			visible = append(visible, "双耳输出")
+		} else {
+			visible = append(visible, fmt.Sprintf("输出已确认 %d声道", status.OutputChannels))
+		}
+	} else {
+		visible = append(visible, "输出未确认")
+	}
+	if status.Passthrough {
+		visible = append(visible, "直通")
+	}
+	if !actualKnown {
+		visible = append(visible, "API 未返回实际档位")
+	}
+	if len(status.PropertyErrors) > 0 {
+		visible = append(visible, "设置错误")
+	}
+	if status.ProcessingNote != "" {
+		visible = append(visible, "处理受限")
+	}
+	if len(visible) == 0 {
+		return "", ""
+	}
+	label = strings.Join(visible, " · ")
+
+	parts := make([]string, 0, 8)
+	parts = append(parts, "请求档位："+orUnknown(reqName))
+	if actualKnown {
+		parts = append(parts, "实际档位："+actualName)
+	} else {
+		parts = append(parts, "实际档位：API 未返回实际档位")
+	}
+	if planName != "" && (!actualKnown || planName != actualName) {
+		parts = append(parts, "计划档位："+planName)
+	}
+	parts = append(parts, "引擎："+orUnknown(engineDisplay(engine)))
+	if status.Hrtf {
+		parts = append(parts, "空间处理：真实 HRTF 双耳卷积（CIPIC 360° HRIR）")
+	}
+	if status.OutputChannels > 0 {
+		out := fmt.Sprintf("输出已确认：%d 声道", status.OutputChannels)
+		if engine == "builtin" && !status.Hrtf {
+			out = fmt.Sprintf("内置固定输出：%d 声道", status.OutputChannels)
+		}
+		if status.OutputLayout != "" {
+			out += "（" + status.OutputLayout + "）"
+		}
+		if status.SampleRate > 0 || status.BitDepth > 0 {
+			out += fmt.Sprintf("，%d Hz / %d bit", status.SampleRate, status.BitDepth)
+		}
+		parts = append(parts, out)
+	} else {
+		parts = append(parts, "输出未确认")
+	}
+	if status.Passthrough {
+		parts = append(parts, "直通：是")
+	}
+	if status.FallbackReason != "" {
+		parts = append(parts, "回退原因："+status.FallbackReason)
+	}
+	if status.ProcessingNote != "" {
+		parts = append(parts, "处理限制："+status.ProcessingNote)
+	}
+	if len(status.PropertyErrors) > 0 {
+		parts = append(parts, "属性读取错误："+strings.Join(status.PropertyErrors, "，"))
+	}
+	return label, strings.Join(parts, "；")
+}
+
+// levelDisplay names a stream level for the badge, short enough to sit beside
+// the clock.
+func levelDisplay(level string) string {
+	if s := netease.ShortLabel(level); s != "" {
+		return s
+	}
+	switch level {
+	case "standard":
+		return "标准"
+	case "higher":
+		return "较高"
+	case "exhigh":
+		return "极高"
+	}
+	return level
+}
+
+// engineDisplay names the engine actually decoding playback.
+func engineDisplay(engine string) string {
+	switch engine {
+	case "builtin":
+		return "内置"
+	case "mpv":
+		return "MPV"
+	case "dlna":
+		return "DLNA"
+	case "hrtf":
+		return "HRTF 双耳"
+	}
+	return ""
+}
+
+func orUnknown(s string) string {
+	if s == "" {
+		return "未知"
+	}
+	return s
 }
 
 // stageBar is the slim bar along the foot of the stage: what plays, where

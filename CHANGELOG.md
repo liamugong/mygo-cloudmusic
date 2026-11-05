@@ -1,5 +1,19 @@
 # 更新日志
 
+## 0.2.22
+
+- 修复耳机 HRTF 播放的状态误报：从 MPV 切到内置 HRTF 时关闭旧 MPV 引擎，Now Playing 不再错误显示「引擎：MPV / 没有 HRTF 双耳」
+- 修复服务端实际返回低于请求档位时的计划错配：按实际 `Stream.Level` 重新计算计划；请求「臻音全景声」但服务端返回「极高」时，不再显示为「沉浸环绕声 / HRTF」
+- 更新版本号至 0.2.22
+
+## 0.2.21
+
+- 耳机空间化升级为真实 HRTF 双耳渲染：内置 CIPIC subject 003 的 1250 个方向、200 taps、44.1 kHz HRIR，按 5.1/7.1/7.1.4 虚拟扬声器方向做双耳卷积，不再只是 crossfeed 串扰下混
+- 耳机模式下 `sky` 5.1 FLAC 直接走 HRTF；`dolby` / `vivid` 因 Go 侧无法解码 E-AC-3 / AV3A，自动改用 `sky` 5.1 FLAC 后 HRTF；`jyeffect` 已是空间化立体声，不重复叠加
+- 保留多声道扬声器与 DLNA 原有路径：DLNA 仍使用 `jyeffect` 立体声投送，避免把未确认能力的多声道直接投给接收器
+- 新增 `internal/hrtf` 数据集、布局映射、流式卷积与重采样测试；HRTF 资源随应用嵌入，不依赖运行时下载
+- 更新版本号至 0.2.21
+
 ## 0.2.20
 
 - 修复空间音频曲目的 macOS 音量问题：`sky` / `jyeffect` / `dolby` / `vivid` 不再使用 CoreAudio 独占模式（Hog Mode），改走系统混音器，macOS 音量键和菜单音量滑杆恢复生效

@@ -113,8 +113,9 @@ type settings struct {
 	// SpatialMode is how multichannel streams are rendered: "auto",
 	// "speakers", "headphones" or "stereo".
 	SpatialMode string `json:"spatialMode,omitempty"`
-	// HrtfProfile selects the headphone crossfeed width: "balanced" or
-	// "wide". MPV builds without a SOFA/HRTF filter use crossfeed.
+	// HrtfProfile is kept for settings written before real HRTF support.
+	// It is no longer used by the headphone renderer: playback uses the
+	// embedded CIPIC HRIR dataset in headphones mode.
 	HrtfProfile string `json:"hrtfProfile,omitempty"`
 
 	// EqualizerEnabled toggles graphic EQ processing in MPV.

@@ -1,9 +1,11 @@
 package player
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -79,7 +81,8 @@ func (c *Cache) FilePath(id int64, level string) string {
 }
 
 // lookup returns a song kept at level or a better one, open to read, with
-// its stream.
+// its stream. The caller owns the returned download, and must Close it when
+// done: it holds the cached file open.
 func (c *Cache) lookup(id int64, level string) (*download, *netease.Stream, bool) {
 	if c == nil {
 		return nil, nil, false
@@ -115,11 +118,17 @@ func (c *Cache) lookup(id int64, level string) (*download, *netease.Stream, bool
 // download fetches the song of the stream st into a file, to keep once it
 // has all come in; or into memory, if the cache would not keep it.
 func (c *Cache) download(id int64, st *netease.Stream) *download {
+	return c.downloadContext(context.Background(), id, st)
+}
+
+// downloadContext is download for a load that can be canceled as a whole:
+// canceling ctx stops the fetch, as closing the returned download does.
+func (c *Cache) downloadContext(ctx context.Context, id int64, st *netease.Stream) *download {
 	part := c.part(st)
 	if part == nil {
-		return startDownloadWith(st.URL, st.Header, st.Size, nil, nil)
+		return startDownloadContext(ctx, st.URL, st.Header, st.Size, nil, nil)
 	}
-	return startDownloadWith(st.URL, st.Header, st.Size, part, func(path string, n int64) (string, bool) {
+	return startDownloadContext(ctx, st.URL, st.Header, st.Size, part, func(path string, n int64) (string, bool) {
 		return c.keep(id, st, path, n)
 	})
 }
@@ -172,9 +181,27 @@ func (c *Cache) keep(id int64, st *netease.Stream, part string, n int64) (string
 	if os.Rename(part, path) != nil {
 		return part, false
 	}
-	os.WriteFile(filepath.Join(c.dir, key+".json"), meta, 0o600)
+	if err := c.keepMeta(key, path, part, meta); err != nil {
+		log.Printf("cache: keep song %d: %v", id, err)
+		return part, false
+	}
 	c.prune(path)
 	return path, true
+}
+
+// keepMeta writes the stream of the song just renamed to path, beside it.
+// If that fails, it puts the song back at part, or removes it if it cannot
+// go back: lookup finds a song through this file, so a song without it
+// would never play again and would take room until pruned.
+func (c *Cache) keepMeta(key, path, part string, meta []byte) error {
+	err := os.WriteFile(filepath.Join(c.dir, key+".json"), meta, 0o600)
+	if err == nil {
+		return nil
+	}
+	if renameErr := os.Rename(path, part); renameErr != nil {
+		os.Remove(path)
+	}
+	return err
 }
 
 // VividPath returns a decoded Audio Vivid WAV kept for id, or "".

@@ -401,6 +401,12 @@ type Stream struct {
 	Type string `json:"type"`
 	// Level is the level served, which may be below the one asked for.
 	Level string `json:"level"`
+	// ServedLevel is the raw level the server reported, before any backfill
+	// with the requested level; empty when the server sent none.
+	ServedLevel string `json:"-"`
+	// LevelReported is whether ServedLevel was a known level the server
+	// itself reported, rather than a value the client filled in.
+	LevelReported bool `json:"-"`
 	// BR and SR are the bit rate and sample rate the server served.
 	BR int64 `json:"br,omitempty"`
 	SR int   `json:"sr,omitempty"`
@@ -491,6 +497,15 @@ func songURLHost(level string) (host, other string) {
 	}
 }
 
+// levelProvenance keeps the level a song URL response reported, before the
+// client fills in the requested one. Served is returned raw so callers can
+// show or log what the server actually said; reported is true only for a
+// known level, so an absent or unfamiliar value is not mistaken for proof of
+// what was served.
+func levelProvenance(served string) (string, bool) {
+	return served, served != "" && slices.Contains(Levels, served)
+}
+
 // songURLAt asks for exactly one level. The host and client profile matter
 // for the higher levels: interface3 serves the song URL endpoint, and
 // Audio Vivid is answered only for a HarmonyOS shaped request.
@@ -544,6 +559,7 @@ func songURLAt(id int64, level string) (*Stream, error) {
 		return nil, ErrUnavailable
 	}
 	s := d.Stream
+	s.ServedLevel, s.LevelReported = levelProvenance(d.Level)
 	s.Type = strings.ToLower(strings.TrimSpace(s.Type))
 	if s.Type == "" {
 		s.Type = EncodeType(level)

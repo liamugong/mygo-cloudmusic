@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 )
 
 var (
@@ -27,6 +29,7 @@ func SetBaseURL(u string) {
 // SetCacheDir overrides the cache directory for testing.
 func SetCacheDir(d string) {
 	cacheDirOverride = d
+	invalidateDownloadState()
 }
 
 // CacheDir returns the directory path where downloaded libmpv binaries are kept.
@@ -54,33 +57,167 @@ func TargetFile() (string, error) {
 	return filepath.Join(dir, asset.Name), nil
 }
 
-// IsDownloaded reports whether the library has already been downloaded to the cache directory.
+// IsDownloaded reports whether the platform library is present in the cache
+// and matches the release metadata. Size is always checked; when the release
+// records a SHA256 the digest is verified too. Digest results are cached by
+// path, size and mtime so status polling does not re-hash a multi-megabyte
+// dylib on every frame.
 func IsDownloaded() bool {
 	p, err := TargetFile()
 	if err != nil {
 		return false
 	}
+	asset, ok := NativeAssets[Platform()]
+	if !ok {
+		return false
+	}
 	fi, err := os.Stat(p)
-	return err == nil && fi.Size() > 1024
+	if err != nil || fi.IsDir() || fi.Size() <= 1024 {
+		return false
+	}
+	if asset.Size > 0 && fi.Size() != asset.Size {
+		return false
+	}
+	if asset.SHA256 == "" {
+		return true
+	}
+	if verified, ok := fileVerified(p, fi); ok && verified {
+		return true
+	}
+	sum, err := fileSHA256(p)
+	if err != nil || !strings.EqualFold(sum, asset.SHA256) {
+		return false
+	}
+	markFileVerified(p, fi)
+	return true
 }
 
-// SystemPath searches system paths to see if libmpv is already installed on the host.
+var (
+	verifyMu       sync.Mutex
+	verifyPath     string
+	verifySize     int64
+	verifyModTime  time.Time
+	verifyAt       time.Time
+	verifyCacheTTL = 5 * time.Minute
+)
+
+func fileVerified(path string, fi os.FileInfo) (bool, bool) {
+	verifyMu.Lock()
+	defer verifyMu.Unlock()
+	if verifyPath != path || verifySize != fi.Size() || !verifyModTime.Equal(fi.ModTime()) {
+		return false, false
+	}
+	if time.Since(verifyAt) > verifyCacheTTL {
+		return false, false
+	}
+	return true, true
+}
+
+func markFileVerified(path string, fi os.FileInfo) {
+	verifyMu.Lock()
+	verifyPath, verifySize, verifyModTime = path, fi.Size(), fi.ModTime()
+	verifyAt = time.Now()
+	verifyMu.Unlock()
+}
+
+func invalidateVerifyCache() {
+	verifyMu.Lock()
+	verifyPath = ""
+	verifyAt = time.Time{}
+	verifyMu.Unlock()
+}
+
+func invalidateDownloadState() {
+	invalidateVerifyCache()
+	resetReadyCache()
+}
+
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// closeLibraryHandleFn releases a handle returned by openLibrary. Unix
+// builds install purego.Dlclose here; platforms without a dlclose binding
+// keep the no-op.
+var closeLibraryHandleFn = func(uintptr) {}
+
+// SystemPath searches system paths to see if libmpv is already installed on
+// the host. Probes are opened and closed again so checking every launch does
+// not leak loader handles.
 func SystemPath() string {
 	for _, name := range SystemLibNames() {
 		h, err := openLibrary(name)
-		if err == nil && h != 0 {
-			// On Unix/Windows, test if mpv_create exists
-			if sym, _ := librarySymbol(h, "mpv_create"); sym != 0 {
-				return name
-			}
+		if err != nil || h == 0 {
+			continue
+		}
+		sym, _ := librarySymbol(h, "mpv_create")
+		closeLibraryHandleFn(h)
+		if sym != 0 {
+			return name
 		}
 	}
 	return ""
 }
 
-// Ready reports whether libmpv is available to use (either system-installed or downloaded).
+var (
+	readyMu    sync.Mutex
+	readyOK    bool
+	readySet   bool
+	readyAt    time.Time
+	readyTTL   = 30 * time.Second
+	readyProbe = probeMPV
+	readyNow   = time.Now
+)
+
+// Ready reports whether libmpv can actually be instantiated, not merely
+// whether a file exists. A downloaded file that is truncated or corrupt is
+// not usable. The answer is cached briefly because player and UI code query
+// it frequently; a failed probe is retried after the same short TTL.
 func Ready() bool {
-	return IsDownloaded() || SystemPath() != ""
+	readyMu.Lock()
+	defer readyMu.Unlock()
+	now := readyNow()
+	if readySet && now.Sub(readyAt) < readyTTL {
+		return readyOK
+	}
+	readyOK = readyProbe()
+	readySet = true
+	readyAt = now
+	return readyOK
+}
+
+func resetReadyCache() {
+	readyMu.Lock()
+	readySet = false
+	readyAt = time.Time{}
+	readyMu.Unlock()
+}
+
+// probeMPV proves the library can be loaded by creating a headless instance
+// with a null audio output and destroying it immediately.
+func probeMPV() bool {
+	if SystemPath() == "" && !IsDownloaded() {
+		return false
+	}
+	inst, err := NewInstance(map[string]string{"ao": "null"})
+	if err != nil {
+		return false
+	}
+	// A successful mpv_create followed by a failed initialize can still
+	// return an instance because the client's raw return check predates the
+	// purego sign-extension fix. Require the version property as proof.
+	version := inst.GetProperty("mpv-version")
+	inst.Close()
+	return version != ""
 }
 
 var (
@@ -169,6 +306,7 @@ func Download(ctx context.Context, onProgress func(done, total int64)) error {
 		return err
 	}
 
+	invalidateDownloadState()
 	return nil
 }
 
@@ -180,7 +318,9 @@ func Delete() error {
 	if err != nil {
 		return err
 	}
-	return os.RemoveAll(dir)
+	err = os.RemoveAll(dir)
+	invalidateDownloadState()
+	return err
 }
 
 type progressReader struct {

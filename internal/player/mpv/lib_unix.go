@@ -11,3 +11,9 @@ func openLibrary(path string) (uintptr, error) {
 func librarySymbol(h uintptr, name string) (uintptr, error) {
 	return purego.Dlsym(h, name)
 }
+
+// purego only exposes Dlclose on Unix; Windows keeps the no-op default from
+// download.go because lib_windows.go opens handles through syscall.
+func init() {
+	closeLibraryHandleFn = func(h uintptr) { _ = purego.Dlclose(h) }
+}
