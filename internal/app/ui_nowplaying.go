@@ -184,7 +184,7 @@ func (a *app) nowPlayingBody(c *ui.Context, tr *netease.Track, art *artwork, acc
 				ui.Row(c).Height(16).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, clock(pl.Position())).FontSize(11).FontFeatures("tnum").TextColor(white.Alpha(0.5))
 					ui.Spacer(c)
-					qualityBadge(c, pl.Stream())
+					qualityBadge(c, pl.Stream(), a.settings.Quality)
 					ui.Spacer(c)
 					status := "-" + clock(pl.Duration()-pl.Position())
 					if pl.Loading() {
@@ -348,14 +348,25 @@ func (a *app) radioChip(c *ui.Context, name string) {
 	}
 }
 
-// qualityBadge marks a lossless stream, as it plays.
-func qualityBadge(c *ui.Context, st *netease.Stream) {
-	if st == nil || !netease.Lossless(st.Level) {
+// qualityBadge marks the high quality stream that plays: lossless, Hi-Res,
+// spatial stereo, surround, master or an immersive format.
+func qualityBadge(c *ui.Context, st *netease.Stream, requested string) {
+	if st == nil {
 		return
 	}
-	label := "无损"
-	if st.Level == "hires" {
-		label = "Hi-Res"
+	label := netease.ShortLabel(st.Level)
+	if label == "" && requested == "" {
+		return
+	}
+	if requested != "" && st.Level != "" && st.Level != requested {
+		if label == "" {
+			label = "已降档"
+		} else {
+			label += " · 已降档"
+		}
+	}
+	if label == "" {
+		return
 	}
 	ui.Text(c, label).FontSize(9.5).FontWeight(800).LetterSpacing(0.6).TextColor(ui.Hex("#f5d58a")).
 		Padding(1, 6).Radius(4).Border(1, ui.Hex("#f5d58a").Alpha(0.55))

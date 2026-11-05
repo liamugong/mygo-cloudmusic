@@ -14,17 +14,58 @@ func (a *app) syncMPVSettings() {
 	if a.pl == nil {
 		return
 	}
+	spdif := a.audioSpdifValue()
+	mode := a.settings.spatialMode()
+	channels := a.settings.MPVAudioChannels
+	switch mode {
+	case "speakers":
+		channels = multichannelLayout
+	case "headphones", "stereo":
+		channels = "stereo"
+	}
+	if channels == "" {
+		channels = "auto-safe"
+	}
 	a.pl.SetUseMPV(a.settings.UseMPV)
 	a.pl.SetMPVConfig(mpv.Config{
 		Exclusive:        a.settings.MPVExclusive,
 		ReplayGain:       a.settings.MPVReplayGain,
 		AudioDevice:      a.settings.MPVAudioDevice,
+		AudioChannels:    channels,
+		AudioSpdif:       spdif,
+		SpatialMode:      mode,
+		HrtfProfile:      a.settings.hrtfProfile(),
 		Gapless:          a.settings.MPVGapless,
 		EqualizerEnabled: a.settings.EqualizerEnabled,
 		EqualizerPreamp:  a.settings.EqualizerPreamp,
 		EqualizerGains:   a.settings.EqualizerGains,
 	})
 	a.pl.SetEqualizer(a.settings.EqualizerPreamp, a.settings.EqualizerGains, a.settings.EqualizerEnabled)
+}
+
+// audioSpdifValue returns the MPV audio-spdif value only when the user has
+// explicitly selected an HDMI/SPDIF receiver. Built-in speakers and "auto"
+// must stay on MPV's normal decoder: they expose only PCM substreams, so
+// forcing compressed passthrough makes CoreAudio fail before E-AC-3 can be
+// decoded. The MPV engine also retries without passthrough if a receiver
+// rejects the stream.
+func (a *app) audioSpdifValue() string {
+	if !a.settings.MPVAudioSpdif || a.pl == nil {
+		return ""
+	}
+	dev := a.settings.MPVAudioDevice
+	if dev == "" || dev == "auto" {
+		return ""
+	}
+	for _, d := range a.pl.AudioDevices() {
+		if d.Name == dev {
+			if mpv.SpdifCapableDevice(d) {
+				return "eac3"
+			}
+			return ""
+		}
+	}
+	return ""
 }
 
 func (a *app) mpvReady() bool {
@@ -186,7 +227,7 @@ func (a *app) renderHifiSettings(c *ui.Context, group func(title string, rows fu
 				}
 
 				row("hifi-mpv-device", "音频输出设备", "独立选择音频路由设备 (如耳机、板载声卡或外置 USB DAC/耳放)", func() {
-					if ui.Select(c.Key("mpv-audio-device"), &chosenDevLabel, devLabels).Label("音频输出设备").Width(240).Changed() {
+					if ui.Select(c.Key("mpv-audio-device"), &chosenDevLabel, devLabels).Label("音频输出设备").Width(220).Changed() {
 						if targetName, ok := labelToDevName[chosenDevLabel]; ok {
 							s.MPVAudioDevice = targetName
 							a.changed()
@@ -196,7 +237,60 @@ func (a *app) renderHifiSettings(c *ui.Context, group func(title string, rows fu
 				})
 			}
 
-			row("hifi-mpv-exclusive", "独占音频输出 (Exclusive Mode)", "绕过系统音频混音器，提供无损 Bit-perfect 直通原音输出", func() {
+			row("hifi-mpv-spatial", "空间音频模式", "自动跟随系统；多声道扬声器适合 HDMI 功放或 USB 多声道声卡；耳机模式在无 SOFA/HRTF 组件时使用低串扰立体声下混；高清臻音已是空间化立体声，不会再叠加 HRTF", func() {
+				labels := []string{"自动（跟随系统）", "多声道扬声器（5.1 / 7.1.4）", "耳机空间化（串扰下混）", "立体声（下混）"}
+				values := []string{"auto", "speakers", "headphones", "stereo"}
+				chosen := labels[0]
+				mode := s.spatialMode()
+				for i, v := range values {
+					if v == mode {
+						chosen = labels[i]
+					}
+				}
+				if ui.Select(c.Key("mpv-spatial-mode"), &chosen, labels).Label("空间音频模式").Width(220).Changed() {
+					for i, label := range labels {
+						if label == chosen {
+							s.SpatialMode = values[i]
+						}
+					}
+					a.changed()
+					a.syncMPVSettings()
+				}
+			})
+			if s.spatialMode() == "headphones" {
+				row("hifi-mpv-hrtf", "耳机空间化强度", "均衡适合日常聆听；宽广会加深串扰与声场宽度，可能牺牲一点人声定位", func() {
+					labels := []string{"均衡", "宽广"}
+					values := []string{"balanced", "wide"}
+					chosen := labels[0]
+					for i, v := range values {
+						if v == s.hrtfProfile() {
+							chosen = labels[i]
+						}
+					}
+					if ui.Select(c.Key("mpv-hrtf-profile"), &chosen, labels).Label("耳机空间化强度").Width(220).Changed() {
+						for i, label := range labels {
+							if label == chosen {
+								s.HrtfProfile = values[i]
+							}
+						}
+						a.changed()
+						a.syncMPVSettings()
+					}
+				})
+			}
+			spdifDesc := "内置扬声器会自动把 E-AC-3 解为 PCM；只有已选择具体 HDMI/SPDIF 接收器时才尝试直通，若设备拒绝会自动回退到 PCM 解码"
+			if a.audioSpdifValue() != "" {
+				spdifDesc = "已选择 HDMI/SPDIF 输出，将尝试把 E-AC-3 原样交给功放；若设备拒绝会自动回退到 PCM 解码"
+			} else if s.MPVAudioSpdif {
+				spdifDesc = "当前输出设备不支持压缩直通，已自动使用 PCM 解码（内置扬声器无需也无法做 bitstream 直通）"
+			}
+			row("hifi-mpv-spdif", "杜比 E-AC-3 直通（仅 HDMI 功放）", spdifDesc, func() {
+				if ui.Switch(c.Key("mpv-spdif"), &s.MPVAudioSpdif).Label("杜比 E-AC-3 直通").Changed() {
+					a.changed()
+					a.syncMPVSettings()
+				}
+			})
+			row("hifi-mpv-exclusive", "独占音频输出 (Exclusive Mode)", "仅立体声 PCM 曲目使用；空间音频与杜比会自动走系统混音，保证 macOS 音量键和音量滑块有效", func() {
 				if ui.Switch(c.Key("mpv-exclusive"), &s.MPVExclusive).Label("独占音频输出").Changed() {
 					a.changed()
 					a.syncMPVSettings()
