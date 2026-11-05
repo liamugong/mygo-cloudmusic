@@ -1072,6 +1072,8 @@ func (p *Player) finishLoad(ctx context.Context, t netease.Track, level string, 
 		p.loadFailed(err, at, skipped)
 		return
 	}
+	plan = p.planForServed(plan, info)
+	level = plan.EffectiveLevel
 	p.info = info
 	p.gain = normGain(info)
 	p.plan = plan
@@ -1132,6 +1134,12 @@ func (p *Player) loadErrorMessage(err error) string {
 
 // playBuiltin hands a decoded stream to the built-in player.
 func (p *Player) playBuiltin(info *netease.Stream, s stream, plan PlaybackPlan, fadeLevel float64, gen int) {
+	// A plan that took the built-in path must not leave an old MPV engine
+	// alive: Status would report MPV and the HRTF badge would disappear.
+	if p.mpvOut != nil {
+		p.mpvOut.Close()
+		p.mpvOut = nil
+	}
 	if s == nil {
 		p.err = "无法解码当前音频格式"
 		p.playing = false
@@ -1179,6 +1187,10 @@ func (p *Player) playBuiltin(info *netease.Stream, s stream, plan PlaybackPlan, 
 
 // playDLNA asks the renderer to play track t from its stream.
 func (p *Player) playDLNA(t netease.Track, info *netease.Stream, s stream, plan PlaybackPlan) {
+	if p.mpvOut != nil {
+		p.mpvOut.Close()
+		p.mpvOut = nil
+	}
 	if s != nil {
 		s.Close()
 	}

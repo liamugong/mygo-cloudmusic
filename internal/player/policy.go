@@ -204,6 +204,23 @@ func (p *Player) planForEngine(level string, engine EngineKind) PlaybackPlan {
 	return PlanPlayback(req)
 }
 
+// planForServed replaces a plan made for the requested level when the
+// server actually served another one. A request for vivid that returns
+// exhigh must not keep the HRTF/5.1 plan: that would render a stereo file
+// through a surround layout and label it as spatial.
+func (p *Player) planForServed(plan PlaybackPlan, info *netease.Stream) PlaybackPlan {
+	if info == nil || info.Level == "" || strings.EqualFold(info.Level, plan.EffectiveLevel) {
+		return plan
+	}
+	next := p.planForEngine(info.Level, plan.Engine)
+	if next.HRTF && plan.HRTF && next.FallbackReason == "" {
+		// The server dropped from vivid/dolby to the sky master; keep the
+		// explanation for why the HRTF path is using sky.
+		next.FallbackReason = plan.FallbackReason
+	}
+	return next
+}
+
 // requestedLevel is the level picked in the settings, before output limits.
 func (p *Player) requestedLevel() string {
 	if p.Quality != nil {

@@ -555,6 +555,29 @@ func TestStatusBuiltin(t *testing.T) {
 	}
 }
 
+// A server that answers a vivid request with exhigh must not leave the
+// HRTF plan in place: exhigh is stereo, not a 5.1 master.
+func TestPlanForServedDropsHRTFWhenServerReturnsStereo(t *testing.T) {
+	p := &Player{}
+	p.mpvCfg.SpatialMode = "headphones"
+	plan := PlanPlayback(PlaybackRequest{
+		RequestedLevel: "vivid",
+		SpatialMode:    "headphones",
+		Engine:         EngineBuiltin,
+		HRTFAvailable:  true,
+	})
+	if !plan.HRTF || plan.EffectiveLevel != "sky" {
+		t.Fatalf("initial plan = %+v", plan)
+	}
+	got := p.planForServed(plan, &netease.Stream{Level: "exhigh"})
+	if got.HRTF || got.EffectiveLevel != "exhigh" {
+		t.Fatalf("served exhigh plan = %+v, want stereo exhigh", got)
+	}
+	if got := p.planForServed(plan, &netease.Stream{Level: "sky"}); !got.HRTF || got.EffectiveLevel != "sky" {
+		t.Fatalf("served sky plan = %+v, want HRTF sky", got)
+	}
+}
+
 // A player with nothing configured still reports a usable engine name.
 func TestStatusZeroPlayer(t *testing.T) {
 	var p Player
