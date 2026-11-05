@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/egoist/mygo/audio"
 	gomp3 "github.com/hajimehoshi/go-mp3"
@@ -54,7 +55,18 @@ func startDownload(url string, size int64, part *os.File, keep func(string, int6
 // startDownloadWith adds per-request headers for a platform stream whose
 // signed media URL must be refreshed for each request.
 func startDownloadWith(url string, header func() http.Header, size int64, part *os.File, keep func(string, int64) (string, bool)) *download {
-	ctx, cancel := context.WithCancel(context.Background())
+	return startDownloadContext(context.Background(), url, header, size, part, keep)
+}
+
+// downloadTimeout bounds one song's fetch as a whole: connecting, waiting
+// for the response, and reading its body. A stalled connection or server
+// then fails the song, rather than leaving playback waiting on it forever.
+var downloadTimeout = 60 * time.Second
+
+// startDownloadContext is startDownloadWith for a load that can be canceled
+// as a whole: canceling ctx stops connecting and reading, as Close does.
+func startDownloadContext(ctx context.Context, url string, header func() http.Header, size int64, part *os.File, keep func(string, int64) (string, bool)) *download {
+	ctx, cancel := context.WithCancel(ctx)
 	d := &download{size: size, cancel: cancel, users: 2}
 	d.cond.L = &d.mu
 	switch {
@@ -63,7 +75,7 @@ func startDownloadWith(url string, header func() http.Header, size int64, part *
 	case size > 0:
 		d.data = make([]byte, 0, prealloc(size))
 	}
-	go d.run(ctx, url, header)
+	go d.run(ctx, url, header, downloadTimeout)
 	return d
 }
 
@@ -89,7 +101,7 @@ func opened(f *os.File, size int64) *download {
 	return d
 }
 
-func (d *download) run(ctx context.Context, url string, header func() http.Header) {
+func (d *download) run(ctx context.Context, url string, header func() http.Header, timeout time.Duration) {
 	defer d.release()
 	finish := func(err error) {
 		d.mu.Lock()
@@ -108,7 +120,8 @@ func (d *download) run(ctx context.Context, url string, header func() http.Heade
 			req.Header[k] = v
 		}
 	}
-	res, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: timeout}
+	res, err := client.Do(req)
 	if err != nil {
 		finish(err)
 		return
@@ -338,9 +351,15 @@ type stream interface {
 // openStream opens the song dl fetches, MP3 or FLAC, as its first bytes
 // say. An MP3 says nothing of its length: durationMs is it.
 func openStream(dl *download, durationMs int64) (stream, error) {
+	return openStreamAllowMultichannel(dl, durationMs, false)
+}
+
+// openStreamAllowMultichannel opens a stream for the HRTF renderer, which
+// can consume more than two FLAC channels. MP3 remains stereo.
+func openStreamAllowMultichannel(dl *download, durationMs int64, allowMultichannel bool) (stream, error) {
 	off := id3Size(dl)
 	if dl.waitFor(off+4) >= off+4 && string(dl.peek(off, 4)) == "fLaC" {
-		return openFLACStream(dl)
+		return openFLACStreamAllow(dl, allowMultichannel)
 	}
 	return openMP3Stream(dl, durationMs)
 }

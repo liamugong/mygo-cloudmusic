@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"math/rand/v2"
 	"net/http"
@@ -84,6 +85,7 @@ type Player struct {
 	out     *audio.Player
 	stream  stream
 	info    *netease.Stream // what the current track streams
+	plan    PlaybackPlan    // how the current track actually plays
 	fade    fader
 	gain    float64 // the current track's normalizing gain
 	loading bool
@@ -91,13 +93,21 @@ type Player struct {
 	err     string
 	gen     int // counts loads, to drop the results of stale ones
 
+	// loadCtx is the current load's context: leaving the track cancels
+	// its downloads, requests and Audio Vivid decode.
+	loadCtx    context.Context
+	loadCancel context.CancelFunc
+
 	lyrics       []lyrics.Line
 	lyricsLoaded bool
 
-	useMPV   bool
-	mpvCfg   mpv.Config
-	mpvOut   *mpv.Engine
-	dlnaCtrl *dlna.Controller
+	// settingsMu guards useMPV and mpvCfg: loading reads them on a
+	// goroutine, while the settings push changes on the main thread.
+	settingsMu sync.Mutex
+	useMPV     bool
+	mpvCfg     mpv.Config
+	mpvOut     *mpv.Engine
+	dlnaCtrl   *dlna.Controller
 	// vividDirs are the temporary MP4/WAV directories of Audio Vivid
 	// tracks that played, removed when the next track loads.
 	vividMu   sync.Mutex
@@ -180,10 +190,73 @@ func (p *Player) announce(t *netease.Track, artwork []byte) {
 	})
 }
 
+// outputKind says which engine is playing now, for RepeatOne.
+type outputKind int
+
+const (
+	outputNone outputKind = iota
+	outputBuiltin
+	outputMPV
+	outputDLNA
+)
+
+// repeatOneStep is what RepeatOne does when a track ends on an output.
+type repeatOneStep int
+
+const (
+	repeatOneNothing repeatOneStep = iota
+	repeatOneBuiltin
+	repeatOneMPV
+	repeatOneDLNA
+)
+
+// repeatOneStepFor picks the RepeatOne action for an output. MPV loops in
+// the engine (SetLoopFile), so its OnEnd does not fire and the player has
+// nothing more to do; the built-in player seeks its decoder, and DLNA asks
+// the renderer to play the current track again.
+func repeatOneStepFor(kind outputKind) repeatOneStep {
+	switch kind {
+	case outputBuiltin:
+		return repeatOneBuiltin
+	case outputMPV:
+		return repeatOneMPV
+	case outputDLNA:
+		return repeatOneDLNA
+	default:
+		return repeatOneNothing
+	}
+}
+
+// currentOutput says which engine owns playback now.
+func (p *Player) currentOutput() outputKind {
+	switch {
+	case p.IsCasting():
+		return outputDLNA
+	case p.mpvOut != nil:
+		return outputMPV
+	case p.out != nil:
+		return outputBuiltin
+	default:
+		return outputNone
+	}
+}
+
 func (p *Player) ended() {
 	if p.repeat == RepeatOne {
-		p.out.Seek(0)
-		p.out.Play()
+		switch repeatOneStepFor(p.currentOutput()) {
+		case repeatOneBuiltin:
+			p.out.Seek(0)
+			p.out.Play()
+		case repeatOneMPV:
+			// Only reached if loop-file did not keep the engine running; seek
+			// and resume rather than touching p.out, which MPV never creates.
+			if p.mpvOut != nil {
+				p.mpvOut.Seek(0)
+				p.mpvOut.Resume()
+			}
+		case repeatOneDLNA:
+			p.replayDLNA()
+		}
 		return
 	}
 	if p.at+1 >= len(p.order) && p.feed != nil {
@@ -196,6 +269,50 @@ func (p *Player) ended() {
 		return
 	}
 	p.Next()
+}
+
+// replayDLNA plays the current track again on the DLNA renderer.
+func (p *Player) replayDLNA() {
+	if p.track == nil || p.info == nil || p.dlnaCtrl == nil {
+		return
+	}
+	meta := p.dlnaTrackMeta(p.track, p.info, p.plan.EffectiveLevel)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := p.dlnaCtrl.PlayTrack(ctx, meta, 0); err != nil {
+		p.err = fmt.Sprintf("无线投送失败: %v", err)
+		p.playing = false
+		p.sync()
+		return
+	}
+	p.pending = 0
+	p.markStarted()
+	p.sync()
+}
+
+// dlnaTrackMeta is what a DLNA renderer needs to play track t.
+func (p *Player) dlnaTrackMeta(t *netease.Track, info *netease.Stream, level string) dlna.TrackMeta {
+	headers := http.Header{}
+	if info.Header != nil {
+		headers = info.Header()
+	}
+	localFile := ""
+	if p.Cache != nil {
+		localFile = p.Cache.FilePath(t.ID, level)
+	}
+	return dlna.TrackMeta{
+		ID:        fmt.Sprintf("%d", t.ID),
+		Title:     t.Name,
+		Artist:    t.ArtistNames(),
+		Album:     t.Album.Name,
+		CoverURL:  netease.Sized(t.Album.PicURL, 600),
+		StreamURL: info.URL,
+		LocalFile: localFile,
+		Format:    info.Type,
+		Duration:  t.Length(),
+		Size:      info.Size,
+		Headers:   headers,
+	}
 }
 
 // PlayQueue replaces the queue with tracks and plays the one at start.
@@ -362,7 +479,12 @@ func (p *Player) ToggleShuffle() {
 	}
 }
 
-func (p *Player) CycleRepeat() { p.repeat = (p.repeat + 1) % 3 }
+func (p *Player) CycleRepeat() {
+	p.repeat = (p.repeat + 1) % 3
+	if p.mpvOut != nil {
+		p.mpvOut.SetLoopFile(p.repeat == RepeatOne)
+	}
+}
 
 // Current returns the track playing or loading, or nil.
 func (p *Player) Current() *netease.Track { return p.track }
@@ -396,7 +518,9 @@ func (p *Player) Lyrics() ([]lyrics.Line, bool) { return p.lyrics, p.lyricsLoade
 // Downloaded returns the share of the current track downloaded so far, or
 // false before it has started to.
 func (p *Player) Downloaded() (float64, bool) {
-	if p.stream == nil {
+	// MPV and DLNA stream for themselves: there is no in-process download
+	// to report, so say so rather than showing a stalled zero.
+	if p.stream == nil || p.mpvOut != nil || p.IsCasting() {
 		return 0, false
 	}
 	dl, _ := p.stream.source()
@@ -420,8 +544,8 @@ type Audio interface {
 // download, waiting for what has not come in, and fails once the track
 // changes. It works on any goroutine once opened; close it when done.
 func (p *Player) OpenAudio() (Audio, error) {
-	if p.stream == nil || p.track == nil {
-		return nil, errors.New("player: nothing loaded")
+	if p.stream == nil || p.track == nil || p.mpvOut != nil || p.IsCasting() {
+		return nil, errors.New("player: audio is not available on this output")
 	}
 	dl, _ := p.stream.source()
 	return openShared(dl, p.track.Duration)
@@ -488,7 +612,11 @@ func (p *Player) SwitchOutput(devID string) {
 		return
 	}
 	wasCasting := p.IsCasting()
-	_ = p.dlnaCtrl.SelectDevice(devID)
+	if err := p.dlnaCtrl.SelectDevice(devID); err != nil {
+		p.err = fmt.Sprintf("切换输出失败: %v", err)
+		p.sync()
+		return
+	}
 
 	if p.track == nil || p.at < 0 {
 		p.sync()
@@ -514,30 +642,65 @@ func (p *Player) SwitchOutput(devID string) {
 
 // SetUseMPV toggles whether to prefer the MPV high-quality audio engine.
 func (p *Player) SetUseMPV(use bool) {
-	if p.useMPV != use {
-		p.useMPV = use
+	p.settingsMu.Lock()
+	changed := p.useMPV != use
+	p.useMPV = use
+	p.settingsMu.Unlock()
+	if !changed {
+		return
+	}
+	// A switch while a track is loaded must take effect now, not only on
+	// the next track: otherwise the UI says MPV is on while the old engine
+	// keeps playing.
+	if p.track != nil && p.at >= 0 && len(p.order) > 0 {
+		pos := p.Position()
+		play := p.playing
+		p.stop()
 		if !use && p.mpvOut != nil {
 			p.mpvOut.Close()
 			p.mpvOut = nil
 		}
+		p.loadSkipping(p.at, 0, play, pos)
+		return
+	}
+	if !use && p.mpvOut != nil {
+		p.mpvOut.Close()
+		p.mpvOut = nil
 	}
 }
 
 // UsingMPV reports whether the MPV high-quality audio engine is active.
 func (p *Player) UsingMPV() bool {
+	return p.usingMPV()
+}
+
+// usingMPV reads the setting and the library's readiness together.
+func (p *Player) usingMPV() bool {
+	p.settingsMu.Lock()
+	defer p.settingsMu.Unlock()
 	return p.useMPV && mpv.Ready()
+}
+
+// mpvConfig returns the current MPV configuration safely, including from
+// the loading goroutine.
+func (p *Player) mpvConfig() mpv.Config {
+	p.settingsMu.Lock()
+	defer p.settingsMu.Unlock()
+	return p.mpvCfg
 }
 
 // SetMPVConfig updates the configuration for MPV playback.
 func (p *Player) SetMPVConfig(cfg mpv.Config) {
+	p.settingsMu.Lock()
 	p.mpvCfg = cfg
+	p.settingsMu.Unlock()
 	if p.mpvOut != nil {
 		p.mpvOut.SetEqualizer(cfg.EqualizerPreamp, cfg.EqualizerGains, cfg.EqualizerEnabled)
 		p.mpvOut.SetAudioDevice(cfg.AudioDevice)
 		p.mpvOut.SetAudioOptions(cfg.AudioChannels, cfg.AudioSpdif)
 		enabled := true
 		if p.info != nil {
-			enabled = spatialProcessingFor(p.info.Level)
+			enabled = p.planFor(p.info.Level).Spatial
 		}
 		p.mpvOut.SetSpatialOptions(cfg.SpatialMode, cfg.HrtfProfile, enabled)
 	}
@@ -545,7 +708,9 @@ func (p *Player) SetMPVConfig(cfg mpv.Config) {
 
 // SetAudioDevice updates the audio output device for MPV.
 func (p *Player) SetAudioDevice(dev string) {
+	p.settingsMu.Lock()
 	p.mpvCfg.AudioDevice = dev
+	p.settingsMu.Unlock()
 	if p.mpvOut != nil {
 		p.mpvOut.SetAudioDevice(dev)
 	}
@@ -561,9 +726,11 @@ func (p *Player) AudioDevices() []mpv.AudioDevice {
 
 // SetEqualizer updates equalizer configuration and pushes to active MPV engine.
 func (p *Player) SetEqualizer(preamp float64, gains [10]float64, enabled bool) {
+	p.settingsMu.Lock()
 	p.mpvCfg.EqualizerEnabled = enabled
 	p.mpvCfg.EqualizerPreamp = preamp
 	p.mpvCfg.EqualizerGains = gains
+	p.settingsMu.Unlock()
 	if p.mpvOut != nil {
 		p.mpvOut.SetEqualizer(preamp, gains, enabled)
 	}
@@ -571,7 +738,7 @@ func (p *Player) SetEqualizer(preamp float64, gains [10]float64, enabled bool) {
 
 // MPVConfig returns the current MPV configuration.
 func (p *Player) MPVConfig() mpv.Config {
-	return p.mpvCfg
+	return p.mpvConfig()
 }
 
 // MPVReady reports whether libmpv is ready to use on this system.
@@ -793,6 +960,11 @@ func (p *Player) Levels() ([Bands]float32, bool) {
 }
 
 func (p *Player) stop() {
+	if p.loadCancel != nil {
+		p.loadCancel()
+		p.loadCancel = nil
+		p.loadCtx = nil
+	}
 	if out := p.out; out != nil {
 		// Paused first, it fades out over a few milliseconds, rather than
 		// stopping with a click.
@@ -804,6 +976,7 @@ func (p *Player) stop() {
 	}
 	p.clearVividDirs()
 	p.out, p.stream, p.info = nil, nil, nil
+	p.plan = PlaybackPlan{}
 	p.seeking = false
 	p.fade.attach(nil, 1)
 }
@@ -839,6 +1012,11 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 	p.pending = from
 	p.announce(&t, nil)
 	p.refill()
+	level := p.requestedLevel()
+	plan := p.planFor(level)
+	p.plan = plan
+	ctx, cancel := context.WithCancel(context.Background())
+	p.loadCtx, p.loadCancel = ctx, cancel
 
 	go func() {
 		cover, err := p.resolveArtwork(&t)
@@ -864,12 +1042,283 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 			}
 		})
 	}()
+
 	go func() {
-		level := "exhigh"
-		if p.Quality != nil {
-			level = p.Quality()
+		info, s, err := p.open(ctx, t, plan)
+		p.post(func() {
+			p.finishLoad(ctx, t, level, plan, info, s, err, at, skipped, gen)
+		})
+	}()
+}
+
+// finishLoad applies what open brought back, on the main thread.
+func (p *Player) finishLoad(ctx context.Context, t netease.Track, level string, plan PlaybackPlan, info *netease.Stream, s stream, err error, at, skipped, gen int) {
+	if gen != p.gen {
+		if s != nil {
+			s.Close()
 		}
-		info, s, err := p.open(t, level)
+		return
+	}
+	p.loading = false
+	if err != nil {
+		if s != nil {
+			s.Close()
+		}
+		// A canceled load is a track switched away from, not a failure
+		// to show the listener.
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		p.loadFailed(err, at, skipped)
+		return
+	}
+	p.info = info
+	p.gain = normGain(info)
+	p.plan = plan
+
+	fadeLevel := 1.0
+	if p.pending > 0 {
+		fadeLevel = 0
+	}
+
+	switch plan.Engine {
+	case EngineDLNA:
+		p.playDLNA(t, info, s, plan)
+	case EngineMPV:
+		if !p.playMPV(ctx, t, info, s, plan, at, gen, fadeLevel) {
+			p.beginBuiltinFallback(ctx, t, level, at, skipped, gen)
+		}
+	default:
+		p.playBuiltin(info, s, plan, fadeLevel, gen)
+	}
+}
+
+// loadFailed reports why a track did not load, and skips on to the next
+// when a few in a row may still play.
+func (p *Player) loadFailed(err error, at, skipped int) {
+	p.err = p.loadErrorMessage(err)
+	// Skip what cannot play, unless nothing in the queue can, or a few in
+	// a row could not: a NAS gone away fails every song, which then flew
+	// by one after another.
+	if skipped+1 < min(len(p.order), maxSkipped) {
+		next := at + 1
+		if next >= len(p.order) {
+			next = 0
+		}
+		p.loadSkipping(next, skipped+1, p.playing, 0)
+		return
+	}
+	p.playing = false
+	p.sync()
+}
+
+// loadErrorMessage turns a load error into what the listener reads. A
+// multichannel FLAC is not a decode failure to hide: it is a track the
+// built-in player cannot render, and MPV can.
+func (p *Player) loadErrorMessage(err error) string {
+	var multichannel *ErrMultichannelFLAC
+	if errors.As(err, &multichannel) {
+		return fmt.Sprintf("该音源为 %d 声道，需要启用 MPV 或使用立体声版本", multichannel.Channels)
+	}
+	switch {
+	case err != netease.ErrUnavailable:
+		return err.Error()
+	case p.track != nil && p.track.ProgramID != 0:
+		return "这期节目需要购买才能收听"
+	default:
+		return "这首歌需要 VIP 才能播放"
+	}
+}
+
+// playBuiltin hands a decoded stream to the built-in player.
+func (p *Player) playBuiltin(info *netease.Stream, s stream, plan PlaybackPlan, fadeLevel float64, gen int) {
+	if s == nil {
+		p.err = "无法解码当前音频格式"
+		p.playing = false
+		p.sync()
+		return
+	}
+	if plan.HRTF {
+		hs, err := newHRTFStream(s, plan.TargetLayout)
+		if err != nil {
+			if s.Channels() > 2 {
+				s.Close()
+				p.err = "HRTF 渲染失败: " + err.Error()
+				p.playing = false
+				p.sync()
+				return
+			}
+			// Stereo can still play; only multichannel would be truncated.
+		} else {
+			s = hs
+		}
+	}
+	p.plan = plan
+	p.stream = s
+	p.out = audio.NewPlayer(s)
+	p.fade.attach(audioPlayerOutput{p.out}, fadeLevel)
+	p.applyGain()
+	p.out.OnEnd(func() {
+		p.post(func() {
+			if gen == p.gen {
+				p.ended()
+			}
+		})
+	})
+	if p.pending > 0 {
+		p.out.Seek(p.pending)
+		p.pending = 0
+	}
+	if p.playing {
+		p.out.Play()
+		p.fade.fade(1, fadeIn, nil)
+		p.markStarted()
+	}
+	p.sync()
+}
+
+// playDLNA asks the renderer to play track t from its stream.
+func (p *Player) playDLNA(t netease.Track, info *netease.Stream, s stream, plan PlaybackPlan) {
+	if s != nil {
+		s.Close()
+	}
+	if p.dlnaCtrl == nil {
+		p.err = "无线投送不可用"
+		p.playing = false
+		p.sync()
+		return
+	}
+	meta := p.dlnaTrackMeta(&t, info, plan.EffectiveLevel)
+	if err := p.dlnaCtrl.PlayTrack(context.Background(), meta, p.pending); err != nil {
+		p.err = fmt.Sprintf("无线投送失败: %v", err)
+		p.playing = false
+		p.sync()
+		return
+	}
+	p.plan = plan
+	p.pending = 0
+	p.markStarted()
+	p.sync()
+}
+
+// playMPV hands a stream URL to MPV. It reports whether MPV took it; on
+// failure the caller falls back to the built-in player.
+func (p *Player) playMPV(ctx context.Context, t netease.Track, info *netease.Stream, s stream, plan PlaybackPlan, at, gen int, fadeLevel float64) bool {
+	if info == nil || !p.usingMPV() {
+		return false
+	}
+	engine := p.mpvOut
+	cfg := p.mpvConfig()
+	if engine == nil || engine.Closed() {
+		var err error
+		engine, err = mpv.NewEngine(cfg)
+		if err != nil {
+			p.mpvOut = nil
+			return false
+		}
+		p.mpvOut = engine
+	}
+	playURL := info.PlayPath
+	if playURL == "" {
+		playURL = info.URL
+		cacheLevel := plan.EffectiveLevel
+		if info.Level != "" {
+			cacheLevel = info.Level
+		}
+		if p.Cache != nil {
+			if f := p.Cache.FilePath(t.ID, cacheLevel); f != "" {
+				playURL = f
+			}
+		}
+	}
+	// If streaming over network and we have a proxy, route via local proxy
+	// to solve auth headers, cookies, range requests and MIME types cleanly.
+	if (strings.HasPrefix(playURL, "http://") || strings.HasPrefix(playURL, "https://")) && p.dlnaCtrl != nil && p.dlnaCtrl.Proxy() != nil {
+		headers := http.Header{}
+		if info.Header != nil {
+			headers = info.Header()
+		}
+		ext := info.Type
+		if ext == "" {
+			ext = t.Format
+		}
+		ext = strings.TrimPrefix(ext, ".")
+		var trackID string
+		if ext != "" {
+			trackID = fmt.Sprintf("mpv-%d-%d.%s", t.ID, time.Now().UnixNano(), ext)
+		} else {
+			trackID = fmt.Sprintf("mpv-%d-%d", t.ID, time.Now().UnixNano())
+		}
+		p.dlnaCtrl.Proxy().Register(trackID, dlna.StreamSource{
+			RemoteURL:   playURL,
+			Headers:     headers,
+			ContentType: dlna.FormatToMIME(info.Type),
+		})
+		playURL = p.dlnaCtrl.Proxy().LocalURL(trackID)
+	}
+	if playURL == "" {
+		engine.Close()
+		p.mpvOut = nil
+		return false
+	}
+	spatial, exclusive := plan.Spatial, plan.Exclusive
+	if info.Level != "" {
+		// The server may have served another level than asked for; its
+		// own level decides whether a spatial filter is needed.
+		served := p.planForEngine(info.Level, EngineMPV)
+		spatial, exclusive = served.Spatial, served.Exclusive
+	}
+	engine.SetSpatialOptions(cfg.SpatialMode, cfg.HrtfProfile, spatial)
+	engine.SetExclusive(exclusive && cfg.Exclusive)
+	engine.SetLoopFile(p.repeat == RepeatOne)
+	if err := engine.Play(playURL, nil, p.pending); err != nil {
+		engine.Close()
+		p.mpvOut = nil
+		return false
+	}
+	p.plan = plan
+	p.fade.attach(mpvVolumeOutput{p: p, e: engine}, fadeLevel)
+	p.applyGain()
+	engine.OnEnd(func() {
+		p.post(func() {
+			if gen == p.gen {
+				p.ended()
+			}
+		})
+	})
+	engine.OnError(func(msg string) {
+		p.post(func() {
+			if gen == p.gen {
+				p.err = msg
+				p.playing = false
+				p.sync()
+			}
+		})
+	})
+	p.pending = 0
+	if p.playing {
+		engine.Resume()
+		p.fade.fade(1, fadeIn, nil)
+		p.markStarted()
+	} else {
+		engine.Pause()
+	}
+	if s != nil {
+		s.Close()
+	}
+	p.sync()
+	p.prefetchNextMPV(ctx, at, gen)
+	return true
+}
+
+// beginBuiltinFallback opens track t for the built-in player after MPV
+// would not take it, and plays it there when it is stereo.
+func (p *Player) beginBuiltinFallback(ctx context.Context, t netease.Track, requested string, at, skipped, gen int) {
+	plan := p.planForEngine(requested, EngineBuiltin)
+	plan.FallbackReason = joinReasons(plan.FallbackReason, "MPV 无法播放，已回退内置播放器")
+	p.plan = plan // Status follows the fallback while the stream opens.
+	go func() {
+		info, s, err := p.openBuiltinStream(ctx, t, plan.EffectiveLevel, plan.HRTF)
 		p.post(func() {
 			if gen != p.gen {
 				if s != nil {
@@ -877,221 +1326,31 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 				}
 				return
 			}
-			p.loading = false
 			if err != nil {
-				p.err = err.Error()
-				switch {
-				case err != netease.ErrUnavailable:
-				case t.ProgramID != 0:
-					p.err = "这期节目需要购买才能收听"
-				default:
-					p.err = "这首歌需要 VIP 才能播放"
-				}
-				// Skip what cannot play, unless nothing in the queue can, or
-				// a few in a row could not: a NAS gone away fails every
-				// song, which then flew by one after another.
-				if skipped+1 < min(len(p.order), maxSkipped) {
-					next := at + 1
-					if next >= len(p.order) {
-						next = 0
-					}
-					p.loadSkipping(next, skipped+1, p.playing, 0)
-				} else {
-					p.playing = false
-					p.sync()
-				}
+				p.loadFailed(err, at, skipped)
 				return
 			}
 			p.info = info
 			p.gain = normGain(info)
-
+			p.plan = plan
 			fadeLevel := 1.0
 			if p.pending > 0 {
 				fadeLevel = 0
 			}
-
-			// 1. DLNA target active: stream via local proxy to remote device.
-			if p.IsCasting() {
-				if s != nil {
-					s.Close()
-				}
-				headers := http.Header{}
-				if info.Header != nil {
-					headers = info.Header()
-				}
-				localFile := ""
-				if p.Cache != nil {
-					localFile = p.Cache.FilePath(t.ID, level)
-				}
-				trackID := fmt.Sprintf("%d", t.ID)
-				meta := dlna.TrackMeta{
-					ID:        trackID,
-					Title:     t.Name,
-					Artist:    t.ArtistNames(),
-					Album:     t.Album.Name,
-					CoverURL:  netease.Sized(t.Album.PicURL, 600),
-					StreamURL: info.URL,
-					LocalFile: localFile,
-					Format:    info.Type,
-					Duration:  t.Length(),
-					Size:      info.Size,
-					Headers:   headers,
-				}
-				if err := p.dlnaCtrl.PlayTrack(context.Background(), meta, p.pending); err != nil {
-					p.err = fmt.Sprintf("无线投送失败: %v", err)
-					p.playing = false
-					p.sync()
-					return
-				}
-				p.pending = 0
-				p.markStarted()
-				p.sync()
-				return
-			}
-
-			// 2. High-quality MPV engine active.
-			if p.UsingMPV() {
-				engine := p.mpvOut
-				if engine == nil || engine.Closed() {
-					var err error
-					engine, err = mpv.NewEngine(p.mpvCfg)
-					if err != nil {
-						p.err = err.Error()
-						p.loading = false
-						p.playing = false
-						p.sync()
-						return
-					}
-					p.mpvOut = engine
-				}
-				playURL := info.PlayPath
-				if playURL == "" {
-					playURL = info.URL
-					cacheLevel := level
-					if info.Level != "" {
-						cacheLevel = info.Level
-					}
-					if p.Cache != nil {
-						if f := p.Cache.FilePath(t.ID, cacheLevel); f != "" {
-							playURL = f
-						}
-					}
-				}
-				// If streaming over network and we have a proxy, route via local proxy
-				// to solve auth headers, cookies, range requests and MIME types cleanly.
-				if (strings.HasPrefix(playURL, "http://") || strings.HasPrefix(playURL, "https://")) && p.dlnaCtrl != nil && p.dlnaCtrl.Proxy() != nil {
-					headers := http.Header{}
-					if info.Header != nil {
-						headers = info.Header()
-					}
-					ext := info.Type
-					if ext == "" {
-						ext = t.Format
-					}
-					ext = strings.TrimPrefix(ext, ".")
-					var trackID string
-					if ext != "" {
-						trackID = fmt.Sprintf("mpv-%d-%d.%s", t.ID, time.Now().UnixNano(), ext)
-					} else {
-						trackID = fmt.Sprintf("mpv-%d-%d", t.ID, time.Now().UnixNano())
-					}
-					p.dlnaCtrl.Proxy().Register(trackID, dlna.StreamSource{
-						RemoteURL:   playURL,
-						Headers:     headers,
-						ContentType: dlna.FormatToMIME(info.Type),
-					})
-					playURL = p.dlnaCtrl.Proxy().LocalURL(trackID)
-				}
-
-				if playURL != "" {
-					// jyeffect is already a spatialised stereo master;
-					// applying crossfeed/HRTF again would colour it twice.
-					engine.SetSpatialOptions(p.mpvCfg.SpatialMode, p.mpvCfg.HrtfProfile, spatialProcessingFor(info.Level))
-					// Spatial streams (Vivid 7.1.4, sky 5.1, Dolby/E-AC-3)
-					// must go through the normal CoreAudio mixer: hog mode
-					// bypasses the system volume and can make macOS volume
-					// keys / the menu slider appear dead. It can also fail
-					// before E-AC-3 is decoded. Keep exclusive mode for
-					// ordinary stereo PCM only.
-					engine.SetExclusive(exclusiveFor(p.mpvCfg.Exclusive, info.Level))
-					if err := engine.Play(playURL, nil, p.pending); err == nil {
-						p.fade.attach(mpvVolumeOutput{p: p, e: p.mpvOut}, fadeLevel)
-						p.applyGain()
-						p.mpvOut.OnEnd(func() {
-							p.post(func() {
-								if gen == p.gen {
-									p.ended()
-								}
-							})
-						})
-						p.mpvOut.OnError(func(msg string) {
-							p.post(func() {
-								if gen == p.gen {
-									p.err = msg
-									p.playing = false
-									p.sync()
-								}
-							})
-						})
-						p.pending = 0
-						if p.playing {
-							p.mpvOut.Resume()
-							p.fade.fade(1, fadeIn, nil)
-							p.markStarted()
-						} else {
-							p.mpvOut.Pause()
-						}
-						if s != nil {
-							s.Close()
-						}
-						p.sync()
-						p.prefetchNextMPV(at, gen)
-						return
-					}
-				}
-			}
-
-			// 3. Built-in pure Go player.
-			if s == nil {
-				p.err = "无法解码当前音频格式"
-				p.playing = false
-				p.sync()
-				return
-			}
-			p.stream = s
-			p.out = audio.NewPlayer(s)
-			p.fade.attach(audioPlayerOutput{p.out}, fadeLevel)
-			p.applyGain()
-			p.out.OnEnd(func() {
-				p.post(func() {
-					if gen == p.gen {
-						p.ended()
-					}
-				})
-			})
-			if p.pending > 0 {
-				p.out.Seek(p.pending)
-				p.pending = 0
-			}
-			if p.playing {
-				p.out.Play()
-				p.fade.fade(1, fadeIn, nil)
-				p.markStarted()
-			}
-			p.sync()
+			p.playBuiltin(info, s, plan, fadeLevel, gen)
 		})
 	}()
 }
 
 // prefetchNextMPV resolves and preloads the next song into MPV's gapless playlist.
-func (p *Player) prefetchNextMPV(at, gen int) {
+func (p *Player) prefetchNextMPV(ctx context.Context, at, gen int) {
 	if !p.UsingMPV() || p.repeat == RepeatOne || p.mpvOut == nil {
 		return
 	}
 	// MPV's af graph is global, so an appended track would inherit the
 	// current track's HRTF/crossfeed filter. Headphone mode starts each
 	// track normally and chooses its filter from that track's level.
-	if p.mpvCfg.SpatialMode == "headphones" {
+	if p.mpvConfig().SpatialMode == "headphones" {
 		return
 	}
 	nextAt := at + 1
@@ -1106,19 +1365,19 @@ func (p *Player) prefetchNextMPV(at, gen int) {
 		return
 	}
 	nextTrack := p.queue[p.order[nextAt]]
+	// Snapshot the request on the main thread; p.Quality may read app
+	// settings, which must not be touched from the prefetch goroutine.
+	level := p.requestedLevel()
+	plan := p.planFor(level)
 	go func() {
-		level := "exhigh"
-		if p.Quality != nil {
-			level = p.Quality()
-		}
-		info, _, err := p.open(nextTrack, level)
+		info, _, err := p.open(ctx, nextTrack, plan)
 		if err != nil || info == nil || (info.URL == "" && info.PlayPath == "") {
 			return
 		}
 		playURL := info.PlayPath
 		if playURL == "" {
 			playURL = info.URL
-			cacheLevel := level
+			cacheLevel := plan.EffectiveLevel
 			if info.Level != "" {
 				cacheLevel = info.Level
 			}
@@ -1151,71 +1410,80 @@ func (p *Player) prefetchNextMPV(at, gen int) {
 		}
 		p.post(func() {
 			if gen == p.gen && p.mpvOut != nil && !p.mpvOut.Closed() {
-				_ = p.mpvOut.Append(playURL)
+				if err := p.mpvOut.Append(playURL); err != nil {
+					log.Printf("player: prefetch append failed: %v", err)
+				}
 			}
 		})
 	}()
 }
 
-// spatialProcessingFor reports whether a level should go through the
-// headphone spatial filter. jyeffect is already spatialised by NetEase and
-// must not be processed twice; ordinary stereo has nothing to render.
-func spatialProcessingFor(level string) bool {
-	return netease.Spatial(level) && level != "jyeffect"
-}
-
-// exclusiveFor keeps hog mode for ordinary stereo PCM. Spatial streams
-// need the CoreAudio mixer so macOS system volume keys and the menu slider
-// keep working; hog mode also makes E-AC-3 initialization less reliable.
-func exclusiveFor(pref bool, level string) bool {
-	return pref && !netease.Spatial(level)
-}
-
-// effectiveLevel lowers a level the current output cannot play. Audio Vivid
-// needs its helper and MPV; surround FLAC needs MPV; casting gets the
-// stereo spatial level.
-func (p *Player) effectiveLevel(level string) string {
-	if level == "vivid" && !av3a.Ready() {
-		level = "sky"
+// open opens track t's audio at the plan it should play with: kept in
+// the cache, or else streamed into it, and kept once it has all come in.
+func (p *Player) open(ctx context.Context, t netease.Track, plan PlaybackPlan) (*netease.Stream, stream, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
-	if p.IsCasting() && netease.Spatial(level) {
-		return "jyeffect"
-	}
-	if !p.UsingMPV() && netease.Spatial(level) {
-		switch level {
-		case "vivid", "dolby", "sky":
-			return "jyeffect"
-		}
-	}
-	return level
-}
-
-// open opens track t's audio at level: kept in the cache, or else
-// streamed into it, and kept once it has all come in.
-func (p *Player) open(t netease.Track, level string) (*netease.Stream, stream, error) {
-	level = p.effectiveLevel(level)
+	level := plan.EffectiveLevel
 	if info, decoded, err, handled := p.resolveAudio(&t, level); handled {
 		return info, decoded, err
 	}
-	if level == "vivid" && p.UsingMPV() {
-		return p.openVivid(t)
+	switch plan.Engine {
+	case EngineMPV:
+		if level == "vivid" {
+			return p.openVivid(ctx, t)
+		}
+		return p.openRemoteStream(ctx, t, level)
+	case EngineDLNA:
+		return p.openRemoteStream(ctx, t, level)
+	default:
+		return p.openBuiltinStream(ctx, t, level, plan.HRTF)
 	}
-	dl, info, ok := p.Cache.lookup(t.ID, level)
+}
+
+// openRemoteStream resolves a stream that MPV or a DLNA renderer fetches
+// itself; there is no decoded stream for the built-in player.
+func (p *Player) openRemoteStream(ctx context.Context, t netease.Track, level string) (*netease.Stream, stream, error) {
+	if p.Cache != nil {
+		if dl, info, ok := p.Cache.lookup(t.ID, level); ok {
+			if dl != nil {
+				dl.Close()
+			}
+			return info, nil, nil
+		}
+	}
+	info, err := p.resolveStream(&t, level)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return info, nil, nil
+}
+
+// openBuiltinStream opens a stream for the built-in decoder: from the
+// cache when kept, else downloaded while it plays.
+func (p *Player) openBuiltinStream(ctx context.Context, t netease.Track, level string, allowMultichannel bool) (*netease.Stream, stream, error) {
+	var dl *download
+	var info *netease.Stream
+	ok := false
+	if p.Cache != nil {
+		dl, info, ok = p.Cache.lookup(t.ID, level)
+	}
 	if !ok {
 		var err error
 		info, err = p.resolveStream(&t, level)
 		if err != nil {
 			return nil, nil, err
 		}
-		if p.UsingMPV() || p.IsCasting() {
-			return info, nil, nil
+		if p.Cache != nil {
+			dl = p.Cache.downloadContext(ctx, t.ID, info)
+		} else {
+			dl = startDownloadContext(ctx, info.URL, info.Header, info.Size, nil, nil)
 		}
-		dl = p.Cache.download(t.ID, info)
 	}
-	if p.UsingMPV() || p.IsCasting() {
-		return info, nil, nil
-	}
-	s, err := openStream(dl, t.Duration)
+	s, err := openStreamAllowMultichannel(dl, t.Duration, allowMultichannel)
 	if err != nil {
 		dl.Close()
 		return nil, nil, err
@@ -1226,15 +1494,21 @@ func (p *Player) open(t netease.Track, level string) (*netease.Stream, stream, e
 // openVivid fetches the AV3A MP4, decodes it to a WAV with the helper, and
 // hands that WAV to MPV. If the server served a lower level, or the helper
 // cannot decode, it falls back to the surround FLAC stream instead.
-func (p *Player) openVivid(t netease.Track) (*netease.Stream, stream, error) {
+func (p *Player) openVivid(ctx context.Context, t netease.Track) (*netease.Stream, stream, error) {
 	info, err := p.resolveStream(&t, "vivid")
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
 	if info.Level != "vivid" {
 		return info, nil, nil
 	}
-	if err := p.prepareVivid(t, info); err != nil {
+	if err := p.prepareVivid(ctx, t, info); err != nil {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
 		fallback, ferr := p.resolveStream(&t, "sky")
 		if ferr == nil {
 			return fallback, nil, nil
@@ -1247,7 +1521,7 @@ func (p *Player) openVivid(t netease.Track) (*netease.Stream, stream, error) {
 // prepareVivid downloads the MP4 to a temporary directory and decodes it
 // into a WAV MPV can play. The directory is removed when the next track
 // loads.
-func (p *Player) prepareVivid(t netease.Track, info *netease.Stream) error {
+func (p *Player) prepareVivid(ctx context.Context, t netease.Track, info *netease.Stream) error {
 	if p.Cache != nil {
 		if cached := p.Cache.VividPath(t.ID); cached != "" {
 			info.PlayPath = cached
@@ -1266,11 +1540,11 @@ func (p *Player) prepareVivid(t netease.Track, info *netease.Stream) error {
 		ext = "mp4"
 	}
 	src := filepath.Join(dir, "source."+ext)
-	if err := downloadStream(info, src); err != nil {
+	if err := downloadStream(ctx, info, src); err != nil {
 		return err
 	}
 	out := filepath.Join(dir, "decoded.wav")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	if err := av3a.Decode(ctx, src, out); err != nil {
 		return err
@@ -1286,8 +1560,8 @@ func (p *Player) prepareVivid(t netease.Track, info *netease.Stream) error {
 }
 
 // downloadStream fetches an authenticated stream URL into path.
-func downloadStream(info *netease.Stream, path string) error {
-	req, err := http.NewRequest(http.MethodGet, info.URL, nil)
+func downloadStream(ctx context.Context, info *netease.Stream, path string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, info.URL, nil)
 	if err != nil {
 		return err
 	}

@@ -20,11 +20,28 @@ import (
 // ErrUnavailable means the helper is not installed for this platform.
 var ErrUnavailable = errors.New("av3a: decoder is not installed")
 
+// ErrNotExecutable means the helper was found but cannot run, as when its
+// executable bit was lost copying or unzipping it.
+var ErrNotExecutable = errors.New("av3a: decoder is not executable")
+
 // BinaryPath returns the helper path: MYGO_AV3A_BINARY, the app's resources,
-// or a resources directory beside the executable during development.
+// or a resources directory beside the executable during development. It
+// returns "" unless the file can actually run.
 func BinaryPath() string {
+	p, err := binaryPath()
+	if err != nil {
+		return ""
+	}
+	return p
+}
+
+// binaryPath returns the helper path, or why the file found cannot be used.
+func binaryPath() (string, error) {
 	if p := strings.TrimSpace(os.Getenv("MYGO_AV3A_BINARY")); p != "" {
-		return p
+		if err := runnable(p); err != nil {
+			return "", err
+		}
+		return p, nil
 	}
 	candidates := make([]string, 0, 3)
 	// The bundled helper is a macOS arm64 binary. On other targets it must
@@ -41,24 +58,48 @@ func BinaryPath() string {
 			)
 		}
 	}
+	var unusable error
 	for _, p := range candidates {
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
-			return p
+		err := runnable(p)
+		if err == nil {
+			return p, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			unusable = err
 		}
 	}
-	return ""
+	if unusable != nil {
+		return "", unusable
+	}
+	return "", ErrUnavailable
 }
 
-// Ready reports whether the decoder helper is installed.
+// runnable checks that path names a file the system can execute. Windows
+// keeps no executable bits, so a regular file is enough there.
+func runnable(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("av3a: decoder %s: %w", path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("av3a: decoder %s is not a regular file", path)
+	}
+	if runtime.GOOS != "windows" && fi.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%w: %s", ErrNotExecutable, path)
+	}
+	return nil
+}
+
+// Ready reports whether the decoder helper is installed and can run.
 func Ready() bool { return BinaryPath() != "" }
 
 // Decode converts an AV3A MP4 to a WAV at output. The helper is stateful
 // per stream; this starts a fresh process, so a seek does not inherit an
 // earlier decoder's history.
 func Decode(ctx context.Context, input, output string) error {
-	bin := BinaryPath()
-	if bin == "" {
-		return ErrUnavailable
+	bin, err := binaryPath()
+	if err != nil {
+		return err
 	}
 	cmd := exec.CommandContext(ctx, bin, "decode", input, output)
 	out, err := cmd.CombinedOutput()
@@ -77,9 +118,9 @@ func Decode(ctx context.Context, input, output string) error {
 
 // Info returns the helper's report for an input, for diagnostics.
 func Info(ctx context.Context, input string) (string, error) {
-	bin := BinaryPath()
-	if bin == "" {
-		return "", ErrUnavailable
+	bin, err := binaryPath()
+	if err != nil {
+		return "", err
 	}
 	out, err := exec.CommandContext(ctx, bin, "info", input).CombinedOutput()
 	if err != nil {

@@ -1,6 +1,7 @@
 package player
 
 import (
+	"context"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -336,4 +337,104 @@ func TestStreamSizeIsNotTrusted(t *testing.T) {
 	if n > maxPrealloc {
 		t.Errorf("set aside %d bytes", n)
 	}
+}
+
+// A server that answers and then sends nothing must not leave the song
+// downloading forever: the client's timeout ends it with an error instead.
+func TestDownloadTimesOut(t *testing.T) {
+	blocked := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		<-blocked
+	}))
+	defer srv.Close()
+	defer close(blocked)
+	old := downloadTimeout
+	downloadTimeout = 100 * time.Millisecond
+	defer func() { downloadTimeout = old }()
+
+	dl := startDownload(srv.URL, 1024, nil, nil)
+	defer dl.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		dl.mu.Lock()
+		done, err := dl.done, dl.err
+		dl.mu.Unlock()
+		if done {
+			if err == nil {
+				t.Fatal("a download of nothing succeeded")
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("download did not time out")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// Close cancels the request being read, not just the readers waiting on
+// it: a server left sending a song sees its context done at once.
+func TestDownloadCloseCancelsRequest(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+	dl := startDownload(srv.URL, 1024, nil, nil)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the request never reached the server")
+	}
+	dl.Close()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close left the request running")
+	}
+}
+
+// Canceling the context a song download was started with stops it, so a
+// load that is abandoned does not keep fetching in the background.
+func TestDownloadContextCancels(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-time.After(5 * time.Second):
+		}
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	dl := startDownloadContext(ctx, srv.URL, nil, 1024, nil, nil)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the request never reached the server")
+	}
+	cancel()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceling the context left the request running")
+	}
+	dl.Close()
 }

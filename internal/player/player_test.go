@@ -1,6 +1,10 @@
 package player
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -8,6 +12,9 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/audio"
+	"github.com/mewkiz/flac"
+	"github.com/mewkiz/flac/frame"
+	"github.com/mewkiz/flac/meta"
 
 	"netease-music-mygo/internal/netease"
 )
@@ -262,51 +269,117 @@ func TestCacheKeepsMP4(t *testing.T) {
 	dl.Close()
 }
 
-// Without MPV, spatial levels go to the stereo spatial FLAC instead of a
-// silent or unsupported surround stream.
-func TestEffectiveLevelWithoutMPV(t *testing.T) {
-	p := &Player{}
-	for _, level := range []string{"sky", "dolby", "vivid"} {
-		if got := p.effectiveLevel(level); got != "jyeffect" {
-			t.Errorf("%s -> %s, want jyeffect", level, got)
-		}
+// PlanPlayback applies output limits: the built-in player and DLNA get
+// stereo spatial masters, vivid needs its helper, and passthrough yields
+// to EQ or headphone spatialisation.
+func TestPlanPlayback(t *testing.T) {
+	tests := []struct {
+		name        string
+		req         PlaybackRequest
+		level       string
+		layout      string
+		passthrough string
+		spatial     bool
+		exclusive   bool
+		hrtf        bool
+		reason      bool
+	}{
+		{
+			name:  "builtin sky falls to jyeffect",
+			req:   PlaybackRequest{RequestedLevel: "sky", Engine: EngineBuiltin},
+			level: "jyeffect", layout: "stereo", reason: true,
+		},
+		{
+			name:  "builtin dolby falls to jyeffect",
+			req:   PlaybackRequest{RequestedLevel: "dolby", Engine: EngineBuiltin},
+			level: "jyeffect", layout: "stereo", reason: true,
+		},
+		{
+			name:  "builtin vivid falls to sky then jyeffect",
+			req:   PlaybackRequest{RequestedLevel: "vivid", Engine: EngineBuiltin, AV3AReady: true},
+			level: "jyeffect", layout: "stereo", reason: true,
+		},
+		{
+			name:  "vivid without helper falls to sky",
+			req:   PlaybackRequest{RequestedLevel: "vivid", Engine: EngineMPV, AV3AReady: false},
+			level: "sky", layout: "5.1", reason: true,
+		},
+		{
+			name:  "dlna spatial falls to jyeffect",
+			req:   PlaybackRequest{RequestedLevel: "dolby", Engine: EngineDLNA},
+			level: "jyeffect", layout: "stereo", reason: true,
+		},
+		{
+			name:  "headphones sky uses HRTF",
+			req:   PlaybackRequest{RequestedLevel: "sky", SpatialMode: "headphones", Engine: EngineBuiltin, HRTFAvailable: true},
+			level: "sky", layout: "5.1(side)", spatial: true, hrtf: true,
+		},
+		{
+			name:  "headphones dolby uses HRTF sky",
+			req:   PlaybackRequest{RequestedLevel: "dolby", SpatialMode: "headphones", Engine: EngineMPV, HRTFAvailable: true},
+			level: "sky", layout: "5.1(side)", spatial: true, hrtf: true, reason: true,
+		},
+		{
+			name:  "headphones vivid uses HRTF sky",
+			req:   PlaybackRequest{RequestedLevel: "vivid", SpatialMode: "headphones", Engine: EngineMPV, AV3AReady: true, HRTFAvailable: true},
+			level: "sky", layout: "5.1(side)", spatial: true, hrtf: true, reason: true,
+		},
+		{
+			name:  "mpv vivid keeps 7.1.4",
+			req:   PlaybackRequest{RequestedLevel: "vivid", Engine: EngineMPV, AV3AReady: true},
+			level: "vivid", layout: "7.1.4", exclusive: false,
+		},
+		{
+			name:  "mpv stereo keeps hog mode",
+			req:   PlaybackRequest{RequestedLevel: "lossless", Engine: EngineMPV},
+			level: "lossless", layout: "stereo", exclusive: true,
+		},
+		{
+			name:  "headphones spatialise surround",
+			req:   PlaybackRequest{RequestedLevel: "sky", Engine: EngineMPV, SpatialMode: "headphones", AV3AReady: true},
+			level: "sky", layout: "stereo", spatial: true, exclusive: false,
+		},
+		{
+			name:  "jyeffect is not spatialised twice",
+			req:   PlaybackRequest{RequestedLevel: "jyeffect", Engine: EngineMPV, SpatialMode: "headphones"},
+			level: "jyeffect", layout: "stereo",
+		},
+		{
+			name:  "spdif passes through only without processing",
+			req:   PlaybackRequest{RequestedLevel: "lossless", Engine: EngineMPV, SpdifPreferred: true},
+			level: "lossless", layout: "stereo", passthrough: "eac3", exclusive: true,
+		},
+		{
+			name:  "eq wins over spdif",
+			req:   PlaybackRequest{RequestedLevel: "lossless", Engine: EngineMPV, SpdifPreferred: true, EqualizerOn: true},
+			level: "lossless", layout: "stereo", passthrough: "", exclusive: true, reason: true,
+		},
 	}
-	if got := p.effectiveLevel("jymaster"); got != "jymaster" {
-		t.Errorf("jymaster -> %s", got)
-	}
-	if got := p.effectiveLevel("standard"); got != "standard" {
-		t.Errorf("standard -> %s", got)
-	}
-}
-
-// jyeffect is already spatialised and must not get a second HRTF pass;
-// true surround and immersive levels should.
-func TestSpatialProcessingFor(t *testing.T) {
-	for _, level := range []string{"sky", "dolby", "vivid"} {
-		if !spatialProcessingFor(level) {
-			t.Errorf("%s should use spatial processing", level)
-		}
-	}
-	for _, level := range []string{"jyeffect", "jymaster", "lossless", "standard"} {
-		if spatialProcessingFor(level) {
-			t.Errorf("%s should not use spatial processing", level)
-		}
-	}
-}
-
-func TestExclusiveForSpatialStreams(t *testing.T) {
-	for _, level := range []string{"sky", "jyeffect", "dolby", "vivid"} {
-		if exclusiveFor(true, level) {
-			t.Errorf("%s must use the CoreAudio mixer for system volume", level)
-		}
-	}
-	for _, level := range []string{"standard", "lossless", "hires", "jymaster"} {
-		if !exclusiveFor(true, level) {
-			t.Errorf("%s should keep exclusive mode", level)
-		}
-	}
-	if exclusiveFor(false, "lossless") {
-		t.Error("exclusive preference was off")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := PlanPlayback(tt.req)
+			if plan.EffectiveLevel != tt.level {
+				t.Errorf("level = %q, want %q", plan.EffectiveLevel, tt.level)
+			}
+			if plan.TargetLayout != tt.layout {
+				t.Errorf("layout = %q, want %q", plan.TargetLayout, tt.layout)
+			}
+			if plan.Passthrough != tt.passthrough {
+				t.Errorf("passthrough = %q, want %q", plan.Passthrough, tt.passthrough)
+			}
+			if plan.Spatial != tt.spatial {
+				t.Errorf("spatial = %v, want %v", plan.Spatial, tt.spatial)
+			}
+			if plan.Exclusive != tt.exclusive {
+				t.Errorf("exclusive = %v, want %v", plan.Exclusive, tt.exclusive)
+			}
+			if plan.HRTF != tt.hrtf {
+				t.Errorf("hrtf = %v, want %v", plan.HRTF, tt.hrtf)
+			}
+			if (plan.FallbackReason != "") != tt.reason {
+				t.Errorf("fallback reason = %q, want present=%v", plan.FallbackReason, tt.reason)
+			}
+		})
 	}
 }
 
@@ -327,5 +400,176 @@ func TestCacheKeepsVividWAV(t *testing.T) {
 	c.Clear()
 	if p := c.VividPath(7); p != "" {
 		t.Fatalf("VividPath after Clear = %q", p)
+	}
+}
+
+// flacChannels maps a channel count to the FLAC channel assignment.
+func flacChannels(n int) frame.Channels {
+	switch n {
+	case 1:
+		return frame.ChannelsMono
+	case 2:
+		return frame.ChannelsLR
+	case 3:
+		return frame.ChannelsLRC
+	case 4:
+		return frame.ChannelsLRLsRs
+	case 5:
+		return frame.ChannelsLRCLsRs
+	case 6:
+		return frame.ChannelsLRCLfeLsRs
+	}
+	return frame.ChannelsMono
+}
+
+// encodeFLAC makes a short FLAC file with n real channels.
+func encodeFLAC(t *testing.T, n, frames int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	info := &meta.StreamInfo{
+		BlockSizeMin:  16,
+		BlockSizeMax:  16,
+		SampleRate:    48000,
+		NChannels:     uint8(n),
+		BitsPerSample: 16,
+		NSamples:      uint64(frames),
+	}
+	enc, err := flac.NewEncoder(&buf, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for at := 0; at < frames; at += 16 {
+		subs := make([]*frame.Subframe, n)
+		for c := 0; c < n; c++ {
+			samples := make([]int32, 16)
+			for i := range samples {
+				samples[i] = int32((at+i)*100 + c*17 - 5000)
+			}
+			subs[c] = &frame.Subframe{Pred: frame.PredVerbatim, Samples: samples, NSamples: 16}
+		}
+		f := &frame.Frame{
+			Header: frame.Header{
+				BlockSize:     16,
+				SampleRate:    48000,
+				Channels:      flacChannels(n),
+				BitsPerSample: 16,
+			},
+			Subframes: subs,
+		}
+		if err := enc.WriteFrame(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// The decoder reports a FLAC file's real channel count: a mono file must
+// not be presented as stereo silence, and a stereo file keeps both sides.
+func TestFLACChannels(t *testing.T) {
+	for _, n := range []int{1, 2} {
+		dl := downloaded(encodeFLAC(t, n, 32))
+		s, err := openFLACStream(dl)
+		if err != nil {
+			t.Fatalf("%d channels: %v", n, err)
+		}
+		if got := s.Channels(); got != n {
+			t.Errorf("%d channels: Channels() = %d", n, got)
+		}
+		buf := make([]float32, 16*n)
+		if got, err := s.Read(buf); err != nil || got != len(buf) {
+			t.Errorf("%d channels: Read = %d, %v", n, got, err)
+		}
+		s.Close()
+	}
+}
+
+// A surround FLAC must be rejected with its real channel count instead of
+// being downmixed to the first two channels and played as if complete.
+func TestMultichannelFLACRejected(t *testing.T) {
+	dl := downloaded(encodeFLAC(t, 6, 32))
+	_, err := openFLACStream(dl)
+	var mc *ErrMultichannelFLAC
+	if !errors.As(err, &mc) {
+		t.Fatalf("err = %v, want ErrMultichannelFLAC", err)
+	}
+	if mc.Channels != 6 {
+		t.Errorf("channels = %d, want 6", mc.Channels)
+	}
+	p := &Player{}
+	if got := p.loadErrorMessage(err); got != "该音源为 6 声道，需要启用 MPV 或使用立体声版本" {
+		t.Errorf("message = %q", got)
+	}
+	dl.Close()
+}
+
+// RepeatOne restarts on the engine that owns playback: the built-in
+// decoder seeks, MPV loops itself, DLNA replays the track, and a missing
+// output does nothing.
+func TestRepeatOneStepByOutput(t *testing.T) {
+	for _, tt := range []struct {
+		kind outputKind
+		want repeatOneStep
+	}{
+		{outputNone, repeatOneNothing},
+		{outputBuiltin, repeatOneBuiltin},
+		{outputMPV, repeatOneMPV},
+		{outputDLNA, repeatOneDLNA},
+	} {
+		if got := repeatOneStepFor(tt.kind); got != tt.want {
+			t.Errorf("output %d: step = %d, want %d", tt.kind, got, tt.want)
+		}
+	}
+}
+
+// statusStream is a decoder with a real channel count, for Status.
+type statusStream struct{ channels int }
+
+func (s statusStream) SampleRate() int                { return 48000 }
+func (s statusStream) Channels() int                  { return s.channels }
+func (s statusStream) Len() int64                     { return 0 }
+func (s statusStream) SetPosition(int64) error        { return nil }
+func (s statusStream) Read([]float32) (int, error)    { return 0, io.EOF }
+func (s statusStream) Close() error                   { return nil }
+func (s statusStream) source() (*download, *spectrum) { return nil, nil }
+
+// Status reports the built-in decoder's real input channels and the
+// stereo output it mixes to, not a guessed surround count.
+func TestStatusBuiltin(t *testing.T) {
+	p := &Player{
+		info:   &netease.Stream{Type: "flac", Level: "lossless", ServedLevel: "lossless", LevelReported: true},
+		stream: statusStream{channels: 1},
+		plan:   PlanPlayback(PlaybackRequest{RequestedLevel: "lossless", Engine: EngineBuiltin}),
+	}
+	st := p.Status()
+	if st.Engine != "builtin" || st.SourceCodec != "flac" {
+		t.Fatalf("engine/codec = %q/%q", st.Engine, st.SourceCodec)
+	}
+	if st.InputChannels != 1 || st.OutputChannels != 2 || st.OutputLayout != "stereo" {
+		t.Fatalf("channels = %d -> %d (%q)", st.InputChannels, st.OutputChannels, st.OutputLayout)
+	}
+	if !st.LevelReported || st.ServedLevel != "lossless" {
+		t.Errorf("served level = %q, reported %v", st.ServedLevel, st.LevelReported)
+	}
+}
+
+// A player with nothing configured still reports a usable engine name.
+func TestStatusZeroPlayer(t *testing.T) {
+	var p Player
+	if st := p.Status(); st.Engine != "builtin" {
+		t.Errorf("engine = %q, want builtin", st.Engine)
+	}
+}
+
+// Leaving a track cancels the load context, so its download and Vivid
+// decode do not keep running for a song nobody hears.
+func TestStopCancelsLoad(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	p := &Player{loadCtx: ctx, loadCancel: cancel}
+	p.stop()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("load context err = %v, want canceled", ctx.Err())
 	}
 }

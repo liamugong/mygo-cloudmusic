@@ -16,17 +16,17 @@ import (
 var ErrUnavailable = errors.New("mpv: library not found or cannot be loaded")
 
 type cFuncs struct {
-	create            func() uintptr
-	initialize        func(handle uintptr) int
-	terminateDestroy  func(handle uintptr)
-	command           func(handle uintptr, cmd **byte) int
-	commandString     func(handle uintptr, cmd *byte) int
-	setOptionString   func(handle uintptr, name, value *byte) int
-	setPropertyString func(handle uintptr, name, value *byte) int
-	getPropertyString func(handle uintptr, name *byte) *byte
-	free              func(ptr unsafe.Pointer)
-	waitEvent         func(handle uintptr, timeout float64) *cEvent
-	wakeup            func(handle uintptr)
+	create             func() uintptr
+	initialize         func(handle uintptr) int
+	terminateDestroy   func(handle uintptr)
+	command            func(handle uintptr, cmd **byte) int
+	commandString      func(handle uintptr, cmd *byte) int
+	setOptionString    func(handle uintptr, name, value *byte) int
+	setPropertyString  func(handle uintptr, name, value *byte) int
+	getPropertyString  func(handle uintptr, name *byte) *byte
+	free               func(ptr unsafe.Pointer)
+	waitEvent          func(handle uintptr, timeout float64) *cEvent
+	wakeup             func(handle uintptr)
 	requestLogMessages func(handle uintptr, minLevel *byte) int
 }
 
@@ -132,18 +132,18 @@ func loadLibraryAt(path string) error {
 	}
 
 	symbols := map[string]any{
-		"mpv_create":                &mpvLib.create,
-		"mpv_initialize":            &mpvLib.initialize,
-		"mpv_terminate_destroy":     &mpvLib.terminateDestroy,
-		"mpv_command":               &mpvLib.command,
-		"mpv_command_string":        &mpvLib.commandString,
-		"mpv_set_option_string":     &mpvLib.setOptionString,
-		"mpv_set_property_string":   &mpvLib.setPropertyString,
-		"mpv_get_property_string":   &mpvLib.getPropertyString,
-		"mpv_free":                  &mpvLib.free,
-		"mpv_wait_event":            &mpvLib.waitEvent,
-		"mpv_wakeup":                &mpvLib.wakeup,
-		"mpv_request_log_messages":  &mpvLib.requestLogMessages,
+		"mpv_create":               &mpvLib.create,
+		"mpv_initialize":           &mpvLib.initialize,
+		"mpv_terminate_destroy":    &mpvLib.terminateDestroy,
+		"mpv_command":              &mpvLib.command,
+		"mpv_command_string":       &mpvLib.commandString,
+		"mpv_set_option_string":    &mpvLib.setOptionString,
+		"mpv_set_property_string":  &mpvLib.setPropertyString,
+		"mpv_get_property_string":  &mpvLib.getPropertyString,
+		"mpv_free":                 &mpvLib.free,
+		"mpv_wait_event":           &mpvLib.waitEvent,
+		"mpv_wakeup":               &mpvLib.wakeup,
+		"mpv_request_log_messages": &mpvLib.requestLogMessages,
 	}
 
 	for symName, fnPtr := range symbols {
@@ -193,7 +193,7 @@ func NewInstance(opts ...map[string]string) (*Instance, error) {
 		}
 	}
 
-	if code := mpvLib.initialize(handle); code < 0 {
+	if code := int32(mpvLib.initialize(handle)); code < 0 {
 		mpvLib.terminateDestroy(handle)
 		return nil, fmt.Errorf("mpv: initialize failed with error code %d", code)
 	}

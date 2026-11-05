@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -95,10 +96,10 @@ func TestPlayerMPVWithProxyHeaders(t *testing.T) {
 		t.Skip("mpv not available")
 	}
 
-	headerReceived := false
+	var headerReceived atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authx") == "test-auth-token" {
-			headerReceived = true
+			headerReceived.Store(true)
 		}
 		// Return minimal dummy bytes
 		w.Header().Set("Content-Type", "text/html; charset=utf-8") // simulate Feiniu's bad content-type
@@ -137,7 +138,7 @@ func TestPlayerMPVWithProxyHeaders(t *testing.T) {
 	}
 
 	start := time.Now()
-	for !headerReceived && time.Since(start) < 2*time.Second {
+	for !headerReceived.Load() && time.Since(start) < 2*time.Second {
 		select {
 		case fn := <-ch:
 			fn()
@@ -145,7 +146,7 @@ func TestPlayerMPVWithProxyHeaders(t *testing.T) {
 		}
 	}
 
-	if !headerReceived {
+	if !headerReceived.Load() {
 		t.Error("expected custom Authx header to be received by the server via proxy")
 	}
 }
