@@ -213,10 +213,21 @@ func (p *Player) planForServed(plan PlaybackPlan, info *netease.Stream) Playback
 		return plan
 	}
 	next := p.planForEngine(info.Level, plan.Engine)
-	if next.HRTF && plan.HRTF && next.FallbackReason == "" {
+	switch {
+	case next.HRTF && plan.HRTF && next.FallbackReason == "":
 		// The server dropped from vivid/dolby to the sky master; keep the
 		// explanation for why the HRTF path is using sky.
 		next.FallbackReason = plan.FallbackReason
+	case plan.HRTF && !next.HRTF:
+		// The server returned a stereo master instead of a spatial one;
+		// say why the headphone plan cannot run instead of showing a
+		// stale "HRTF" plan. jyeffect is already spatial, so it has its
+		// own explanation.
+		if info.Level == "jyeffect" {
+			next.FallbackReason = "高清臻音已是空间化立体声，不再叠加 HRTF"
+		} else if !netease.Spatial(info.Level) {
+			next.FallbackReason = "服务端实际返回 " + netease.LevelLabel(info.Level) + "，不是空间音源，HRTF 未启用"
+		}
 	}
 	return next
 }
